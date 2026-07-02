@@ -25,6 +25,12 @@ PSEUDO_INTERFACE_PREFIXES = (
     'lo', 'enc', 'pflog', 'vlan', 'wg', 'ovpn', 'gif', 'gre', 'ipsec', 'tun', 'bridge',
 )
 
+# LAG-style aggregate interfaces map to NetBox's 'lag' type instead of
+# 'virtual'/'other'. Kept distinct from PSEUDO_INTERFACE_PREFIXES because a
+# lagg's MAC address is a real, stable hardware address (borrowed from one
+# of its members) and can still be used for MAC-based matching.
+LAG_INTERFACE_PREFIXES = ('lagg', 'trunk')
+
 class OPNsenseSyncScript(Script):
     class Meta:
         name = "OPNsense Sync"
@@ -140,11 +146,18 @@ class OPNsenseSyncScript(Script):
             self.log_warning(f"{label}: {path} returned HTTP {resp.status_code}")
         return None
 
-    def _extract_ipv4_cidrs(self, ipv4_list):
+    def _extract_cidrs(self, ip_list):
+        """
+        Normalizes an OPNsense ipv4/ipv6 row entry into a list of CIDR
+        strings. Shared across both address families: the 'subnetbits' and
+        bare-address shapes are identical for v4 and v6, and only the
+        legacy hex-netmask shape (IPv4-only 'netmask') needs family-specific
+        handling.
+        """
         cidrs = []
-        if not isinstance(ipv4_list, list):
+        if not isinstance(ip_list, list):
             return cidrs
-        for entry in ipv4_list:
+        for entry in ip_list:
             if isinstance(entry, str):
                 cidrs.append(entry)
             elif isinstance(entry, dict):
@@ -165,6 +178,25 @@ class OPNsenseSyncScript(Script):
                     except Exception:
                         pass
         return cidrs
+
+    def _infer_interface_type(self, if_name):
+        """
+        Best-effort NetBox InterfaceTypeChoices value for a physical Device
+        interface. Unlike VMInterface, Interface.type has no default and is
+        required, so something must be supplied. OPNsense's API doesn't
+        report link media/speed for the general case, and guessing a
+        specific physical type (e.g. '1000base-t') risks recording a wrong
+        speed, so real NICs map to 'other' rather than a fabricated media
+        type. See https://netboxlabs.com/docs/netbox/models/dcim/interface/.
+        """
+        name = if_name.lower()
+        if name.startswith(LAG_INTERFACE_PREFIXES):
+            return 'lag'
+        if name.startswith('bridge'):
+            return 'bridge'
+        if name.startswith(PSEUDO_INTERFACE_PREFIXES):
+            return 'virtual'
+        return 'other'
 
     def _get_interface_names_map(self):
         data = self._api_get_with_fallback(
@@ -201,8 +233,13 @@ class OPNsenseSyncScript(Script):
             interfaces.append({
                 'device': device,
                 'description': row.get('description') or names_map.get(device, device),
-                'ipv4': self._extract_ipv4_cidrs(row.get('ipv4')),
+                'ipv4': self._extract_cidrs(row.get('ipv4')),
+                'ipv6': self._extract_cidrs(row.get('ipv6')),
                 'macaddr': row.get('macaddr'),
+                # 'enabled' reflects the admin/config state (interface assigned
+                # and not disabled), as distinct from 'status' (link up/down).
+                # Missing key (older cores) is treated as enabled.
+                'enabled': row.get('enabled', True),
             })
         return interfaces
 
@@ -256,7 +293,11 @@ class OPNsenseSyncScript(Script):
                 'device': phys_name,
                 'description': descr,
                 'ipv4': [],
-                'macaddr': None
+                'ipv6': [],
+                'macaddr': None,
+                # This legacy path has no reliable admin-state signal, so
+                # interfaces are assumed enabled rather than left blank.
+                'enabled': True,
             }
 
             stat = stats_by_device.get(phys_name)
@@ -273,8 +314,10 @@ class OPNsenseSyncScript(Script):
                 elif 'ether' in stat:
                     iface_data['macaddr'] = stat['ether']
 
-                iface_data['ipv4'].extend(self._extract_ipv4_cidrs(stat.get('ipv4')))
-                iface_data['ipv4'].extend(self._extract_ipv4_cidrs(stat.get('inet')))
+                iface_data['ipv4'].extend(self._extract_cidrs(stat.get('ipv4')))
+                iface_data['ipv4'].extend(self._extract_cidrs(stat.get('inet')))
+                iface_data['ipv6'].extend(self._extract_cidrs(stat.get('ipv6')))
+                iface_data['ipv6'].extend(self._extract_cidrs(stat.get('inet6')))
             else:
                 self.log_info(f"No stats found for {phys_name} ({descr})")
 
@@ -426,21 +469,36 @@ class OPNsenseSyncScript(Script):
             if not nb_iface:
                 nb_iface = InterfaceModel.objects.filter(name=if_name, **filter_kwargs).first()
             
+            enabled = iface.get('enabled', True)
+
             if not nb_iface:
                 self.log_success(f"Creating interface {if_name}")
-                nb_iface = InterfaceModel.objects.create(
-                    name=if_name,
-                    description=if_descr,
-                    **filter_kwargs
-                )
+                create_kwargs = {
+                    'name': if_name,
+                    'description': if_descr,
+                    'enabled': enabled,
+                    **filter_kwargs,
+                }
+                if InterfaceModel is Interface:
+                    # Physical Interface.type is required with no default
+                    # (VMInterface has no such field), so it must be set on
+                    # creation or NetBox rejects the object outright.
+                    create_kwargs['type'] = self._infer_interface_type(if_name)
+                nb_iface = InterfaceModel.objects.create(**create_kwargs)
             else:
                 if nb_iface.name != if_name:
                     self.log_info(f"Renaming interface {nb_iface.name} to {if_name} (matched by MAC)")
                     nb_iface.name = if_name
-                
+
                 if nb_iface.description != if_descr:
                     nb_iface.description = if_descr
-                
+
+                if nb_iface.enabled != enabled:
+                    nb_iface.enabled = enabled
+
+                if InterfaceModel is Interface and not nb_iface.type:
+                    nb_iface.type = self._infer_interface_type(if_name)
+
                 nb_iface.save()
 
             if mac_addr:
@@ -456,16 +514,17 @@ class OPNsenseSyncScript(Script):
                     self.log_failure(f"Error syncing MAC for {if_name}: {e}")
 
             ips_to_sync = []
-            
+
             if iface.get('ipaddr') and iface.get('mask'):
                 ips_to_sync.append(f"{iface.get('ipaddr')}/{iface.get('mask')}")
-            
-            ipv4_list = iface.get('ipv4', [])
-            if isinstance(ipv4_list, list):
-                for ip_info in ipv4_list:
-                    if isinstance(ip_info, str): ips_to_sync.append(ip_info)
-                    elif isinstance(ip_info, dict): 
-                        ips_to_sync.append(f"{ip_info.get('ipaddr')}/{ip_info.get('mask')}")
+
+            for family_key in ('ipv4', 'ipv6'):
+                ip_list = iface.get(family_key, [])
+                if isinstance(ip_list, list):
+                    for ip_info in ip_list:
+                        if isinstance(ip_info, str): ips_to_sync.append(ip_info)
+                        elif isinstance(ip_info, dict):
+                            ips_to_sync.append(f"{ip_info.get('ipaddr')}/{ip_info.get('mask')}")
 
             for cidr in ips_to_sync:
                 self.sync_ip(nb_iface, cidr)
