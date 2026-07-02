@@ -10,6 +10,8 @@ This script synchronizes network configuration from an OPNsense firewall into Ne
 
 ## Installation
 
+### Bare-metal / traditional install
+
 1.  Copy `opnsense_sync.py` to your NetBox scripts directory (usually `/opt/netbox/netbox/scripts/`).
 2.  Ensure the file is readable by the NetBox user.
 3.  Restart the NetBox RQ worker (or the entire NetBox service) to pick up the new script.
@@ -18,6 +20,29 @@ This script synchronizes network configuration from an OPNsense firewall into Ne
     # OR
     sudo systemctl restart netbox-rq
     ```
+
+### Docker install (e.g. netbox-community/netbox-docker)
+
+Copying the file directly into a running container (`docker cp`, etc.) does **not**
+work reliably and the file will not survive a container recreation (`docker compose
+up -d` after a `pull`/rebuild) - the container filesystem is ephemeral. Tested
+against NetBox Community `v4.6.4-Docker-5.0.1`.
+
+1.  Upload the script through the NetBox GUI instead: **Customization** > **Scripts**
+    > the **+** button > select `opnsense_sync.py`. NetBox stores it in its `scripts`
+    volume, so this survives container restarts.
+2.  For a persistent, editable-from-the-host setup, bind-mount a local directory to
+    the scripts path in your `docker-compose.override.yml` instead of relying on the
+    upload flow, e.g.:
+    ```yaml
+    services:
+      netbox:
+        volumes:
+          - ./scripts:/opt/netbox/netbox/scripts:z
+    ```
+    then place `opnsense_sync.py` in `./scripts/` on the host and restart the stack
+    (`docker compose up -d`). No RQ worker restart is needed for either method -
+    NetBox picks up scripts on next load of the Scripts page.
 
 ## Usage
 
@@ -67,6 +92,11 @@ still open/closed-not-planned upstream. This script tries the current snake_case
 endpoint first and automatically falls back to the legacy camelCase name, so it
 works against both pre- and post-25.7 installs without configuration.
 
+The privilege list above and the endpoint fallback behavior have been validated
+against a live OPNsense 25.7.10 instance with an API user scoped to exactly
+those privileges (no `All Pages`): interfaces synced with full MAC/IP data via
+the Overview API, and ARP sync worked with zero fallback warnings.
+
 One endpoint has no narrow-privilege path at all: `get_interface_config` /
 `getInterfaceConfig` is not covered by any ACL pattern in stock OPNsense, at any
 privilege short of `All Pages`. This script no longer depends on it for normal
@@ -79,4 +109,8 @@ it being used, either upgrade OPNsense or grant `All Pages` to the API user.
 
 *   **"Virtual Machine not found"**: Ensure the name in the script form matches the VM name in NetBox exactly.
 *   **SSL Errors**: If using self-signed certificates on OPNsense, uncheck the "Verify SSL" box in the script form.
-*   **Interfaces sync but have no IP/MAC data**: Check the script's run log for `log_warning` entries — as of this release, every non-200 response from an OPNsense API call is logged with the URL and status code. A 403 almost always means a missing privilege; see the permissions list above.
+*   **Interfaces sync but have no IP/MAC data**: Check the script's run log for `log_warning` entries — as of this release, every non-200 response from an OPNsense API call is logged with the URL and status code.
+*   **Every OPNsense API call fails, including the very first one**: Look at the status code in the log, not just "it failed":
+    *   **HTTP 401** on every single call means authentication itself is being rejected — this is a bad/mismatched API key or secret (double-check for copy/paste whitespace or truncation), or OPNsense's login-protection lockout is temporarily blocking the account after repeated bad attempts (check **System > Access > Users**). It is not a privilege problem, and granting more privileges will not fix it.
+    *   **HTTP 403** on a specific endpoint means the credentials are valid but the API user is missing that endpoint's privilege; see the permissions list above.
+*   **Interface names/descriptions look wrong or get reassigned/renamed across runs**: Known issue with MAC-based interface matching colliding across pseudo-interfaces (`enc0`, `pflog0`, VLAN sub-interfaces, WireGuard `wg*`) that report duplicate/placeholder MAC addresses — tracked in [#3](https://github.com/StevenWolfe/Netbox-OPNSense-Importer/issues/3).
