@@ -33,16 +33,26 @@ against NetBox Community `v4.6.4-Docker-5.0.1`.
     volume, so this survives container restarts.
 2.  For a persistent, editable-from-the-host setup, bind-mount a local directory to
     the scripts path in your `docker-compose.override.yml` instead of relying on the
-    upload flow, e.g.:
+    upload flow. **Mount it on both the `netbox` and `netbox-worker` services**, not
+    just `netbox`: NetBox always runs scripts as a background RQ job (see
+    `netbox/jobs.py` / `ScriptJob` upstream), which is executed by the worker
+    container, not the web process. The web container only needs the file to list the
+    script and render its form - it never actually runs it. If the mount is missing on
+    `netbox-worker`, the script will show up fine in the UI but fail (or the job will
+    hang/error) when you click **Run Script**.
     ```yaml
     services:
       netbox:
         volumes:
           - ./scripts:/opt/netbox/netbox/scripts:z
+      netbox-worker:
+        volumes:
+          - ./scripts:/opt/netbox/netbox/scripts:z
     ```
-    then place `opnsense_sync.py` in `./scripts/` on the host and restart the stack
-    (`docker compose up -d`). No RQ worker restart is needed for either method -
-    NetBox picks up scripts on next load of the Scripts page.
+    Then place `opnsense_sync.py` in `./scripts/` on the host and restart the stack
+    (`docker compose up -d`). Restart (or recreate) both containers after adding or
+    changing a script file - a plain reload of the Scripts page is not always enough,
+    since the worker process may have already imported the old module.
 
 ## Usage
 
