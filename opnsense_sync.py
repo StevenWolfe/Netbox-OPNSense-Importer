@@ -10,6 +10,21 @@ from virtualization.models import VirtualMachine, VMInterface
 # Disable SSL warnings for self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# MAC values OPNsense reports for interfaces that have no real hardware
+# address (loopback, IPsec enc, pflog, WireGuard, ...). These are not
+# unique per-interface, so they must never be used to match an incoming
+# interface to an existing NetBox interface.
+PLACEHOLDER_MACS = {None, '', '00:00:00:00:00:00'}
+
+# Pseudo/virtual interface name prefixes. VLAN sub-interfaces and tunnel
+# interfaces frequently inherit their parent interface's real MAC address
+# (or share the same placeholder MAC as other pseudo-interfaces), so
+# MAC-based matching is unreliable for these - always match by name instead.
+# See issue #3.
+PSEUDO_INTERFACE_PREFIXES = (
+    'lo', 'enc', 'pflog', 'vlan', 'wg', 'ovpn', 'gif', 'gre', 'ipsec', 'tun', 'bridge',
+)
+
 class OPNsenseSyncScript(Script):
     class Meta:
         name = "OPNsense Sync"
@@ -385,11 +400,16 @@ class OPNsenseSyncScript(Script):
                 
             if_descr = iface.get('description', '')
             mac_addr = iface.get('macaddr')
-            
+            if mac_addr and mac_addr.lower() in PLACEHOLDER_MACS:
+                mac_addr = None
+
+            is_pseudo = if_name.lower().startswith(PSEUDO_INTERFACE_PREFIXES)
+
             nb_iface = None
-            
-            # 1. Try to find by MAC Address first
-            if mac_addr:
+
+            # 1. Try to find by MAC Address first (skipped for pseudo/virtual
+            # interfaces - see PSEUDO_INTERFACE_PREFIXES above)
+            if mac_addr and not is_pseudo:
                 try:
                     mac_obj = MACAddress.objects.filter(mac_address=mac_addr).first()
                     if mac_obj and mac_obj.assigned_object:
