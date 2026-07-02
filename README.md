@@ -4,8 +4,8 @@ This script synchronizes network configuration from an OPNsense firewall into Ne
 
 ## Features
 
-1.  **Interface Sync**: Imports all interfaces (LAN, WAN, VLANs, WireGuard, etc.) from OPNsense.
-2.  **IP Address Sync**: Assigns the correct IP addresses and subnets to those interfaces.
+1.  **Interface Sync**: Imports all interfaces (LAN, WAN, VLANs, WireGuard, etc.) from OPNsense, including name, description, admin-enabled state, and (for physical Devices) a best-effort NetBox interface `type`.
+2.  **IP Address Sync**: Assigns the correct IPv4 *and* IPv6 addresses and subnets to those interfaces.
 3.  **ARP Discovery**: Fetches the ARP table from OPNsense and automatically assigns IP addresses to **other** devices/VMs in NetBox based on their MAC address.
 
 ## Installation
@@ -114,3 +114,25 @@ it being used, either upgrade OPNsense or grant `All Pages` to the API user.
     *   **HTTP 401** on every single call means authentication itself is being rejected — this is a bad/mismatched API key or secret (double-check for copy/paste whitespace or truncation), or OPNsense's login-protection lockout is temporarily blocking the account after repeated bad attempts (check **System > Access > Users**). It is not a privilege problem, and granting more privileges will not fix it.
     *   **HTTP 403** on a specific endpoint means the credentials are valid but the API user is missing that endpoint's privilege; see the permissions list above.
 *   **Interface names/descriptions look wrong or get reassigned/renamed across runs**: Fixed in this release — pseudo-interfaces (`lo*`, `enc*`, `pflog*`, `vlan*`, `wg*`, `ovpn*`, `gif*`, `gre*`, `ipsec*`, `tun*`, `bridge*`) are now always matched by name instead of MAC, since they often report a shared placeholder MAC (`00:00:00:00:00:00`) or inherit their parent interface's MAC. See [#3](https://github.com/StevenWolfe/Netbox-OPNSense-Importer/issues/3).
+
+## Known Limitations / Not Yet Synced
+
+The following NetBox interface fields are intentionally left alone for now.
+None of them are populated from OPNsense today:
+
+*   **`type` on physical Devices**: set to a best-effort guess (`virtual` for
+    pseudo-interfaces, `lag`/`bridge` where the name implies it, `other` for
+    real NICs) since OPNsense's overview API doesn't report link media/speed.
+    If you know the real media type, override it by hand in NetBox — the
+    script only sets `type` on creation or when it's still unset, so it won't
+    clobber a manual correction.
+*   **VLAN `parent` / tagged-mode relationships**: a `vlan0.10`-style
+    sub-interface is imported as a standalone interface, not linked to its
+    parent physical interface via NetBox's `parent`/`mode`/`tagged_vlans`
+    fields.
+*   **`bridge` / `lag` membership**: member interfaces aren't linked to their
+    bridge/lagg via NetBox's `bridge`/`lag` fields.
+*   **`mtu`, `speed`, `duplex`**: not read from OPNsense.
+*   **`label`**: NetBox's physical-port label field is left blank; OPNsense's
+    human-readable name is written to `description` instead, which is the
+    conventional NetBox mapping.
